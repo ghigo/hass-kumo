@@ -1,5 +1,4 @@
 """HomeAssistant climate component for KumoCloud connected HVAC units."""
-import asyncio
 import logging
 import pprint
 
