@@ -1,4 +1,5 @@
 """HomeAssistant climate component for KumoCloud connected HVAC units."""
+import asyncio
 import logging
 import pprint
 
@@ -458,7 +459,11 @@ class KumoThermostat(CoordinatedKumoEntity, ClimateEntity):
             "manufacturer": "Mitsubishi",
         }
 
-    def set_temperature(self, **kwargs):
+    def _request_refresh(self):
+        """Fire a background coordinator refresh (used on command failure)."""
+        self.hass.async_create_task(self.coordinator.async_request_refresh())
+
+    async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
         _LOGGER.debug(
             "Kumo %s set temp: %s, current mode %s",
@@ -471,7 +476,6 @@ class KumoThermostat(CoordinatedKumoEntity, ClimateEntity):
             _LOGGER.warning("Kumo %s is not available", self._name)
             return
 
-        # Validate arguments
         current_mode = self._hvac_mode
         proposed_mode = kwargs.get(ATTR_HVAC_MODE)
         target_mode = proposed_mode or current_mode
@@ -508,26 +512,47 @@ class KumoThermostat(CoordinatedKumoEntity, ClimateEntity):
             return
 
         if current_mode != target_mode:
-            self.set_hvac_mode(target_mode)
+            await self.async_set_hvac_mode(target_mode)
 
+        # Build a separate dict with values converted to Celsius for pykumo,
+        # keeping `target` in user-visible units for the optimistic update below.
+        target_c = dict(target)
         if self._use_fahrenheit:
-            if "cool" in target and target["cool"] is not None:
-                target["cool"] = f_to_c(target["cool"])
-            if "heat" in target and target["heat"] is not None:
-                target["heat"] = f_to_c(target["heat"])
+            if "cool" in target_c and target_c["cool"] is not None:
+                target_c["cool"] = f_to_c(target_c["cool"])
+            if "heat" in target_c and target_c["heat"] is not None:
+                target_c["heat"] = f_to_c(target_c["heat"])
 
-        if "cool" in target:
-            response = self._pykumo.set_cool_setpoint(target["cool"])
-            _LOGGER.debug(
-                "Kumo %s set %s temp response: %s", self._name, "cool", str(response)
+        success = True
+        if "cool" in target_c:
+            response = await self.hass.async_add_executor_job(
+                self._pykumo.set_cool_setpoint, target_c["cool"]
             )
-        if "heat" in target:
-            response = self._pykumo.set_heat_setpoint(target["heat"])
-            _LOGGER.debug(
-                "Kumo %s set %s temp response: %s", self._name, "heat", str(response)
+            _LOGGER.debug("Kumo %s set cool temp response: %s", self._name, response)
+            if not response:
+                success = False
+        if "heat" in target_c:
+            response = await self.hass.async_add_executor_job(
+                self._pykumo.set_heat_setpoint, target_c["heat"]
             )
+            _LOGGER.debug("Kumo %s set heat temp response: %s", self._name, response)
+            if not response:
+                success = False
 
-    def set_hvac_mode(self, hvac_mode, caller="set_hvac_mode"):
+        if success:
+            if target_mode == HVACMode.HEAT_COOL:
+                self._target_temperature_high = target.get("cool")
+                self._target_temperature_low = target.get("heat")
+                self._target_temperature = None
+            elif target_mode == HVACMode.COOL:
+                self._target_temperature = target.get("cool")
+            elif target_mode == HVACMode.HEAT:
+                self._target_temperature = target.get("heat")
+            self.async_write_ha_state()
+        else:
+            self._request_refresh()
+
+    async def async_set_hvac_mode(self, hvac_mode, caller="async_set_hvac_mode"):
         """Set new target operation mode."""
         try:
             mode = HA_STATE_TO_KUMO[hvac_mode]
@@ -538,29 +563,55 @@ class KumoThermostat(CoordinatedKumoEntity, ClimateEntity):
             _LOGGER.warning("Kumo %s is not available", self._name)
             return
 
-        response = self._pykumo.set_mode(mode)
+        response = await self.hass.async_add_executor_job(self._pykumo.set_mode, mode)
         _LOGGER.debug(
-            "Kumo %s set mode %s (via `%s`) response: %s", self._name, hvac_mode, caller, response
+            "Kumo %s set mode %s (via `%s`) response: %s",
+            self._name,
+            hvac_mode,
+            caller,
+            response,
         )
 
-    def set_swing_mode(self, swing_mode):
+        if response:
+            self._hvac_mode = hvac_mode
+            self.async_write_ha_state()
+        else:
+            self._request_refresh()
+
+    async def async_set_swing_mode(self, swing_mode):
         """Set new vane swing mode."""
         if not self.available:
             _LOGGER.warning("Kumo %s is not available", self._name)
             return
 
-        response = self._pykumo.set_vane_direction(swing_mode)
+        response = await self.hass.async_add_executor_job(
+            self._pykumo.set_vane_direction, swing_mode
+        )
         _LOGGER.debug("Kumo %s set swing mode response: %s", self._name, response)
 
-    def set_fan_mode(self, fan_mode):
+        if response:
+            self._swing_mode = swing_mode
+            self.async_write_ha_state()
+        else:
+            self._request_refresh()
+
+    async def async_set_fan_mode(self, fan_mode):
         """Set new fan speed mode."""
         if not self.available:
             _LOGGER.warning("Kumo %s is not available", self._name)
             return
 
-        response = self._pykumo.set_fan_speed(fan_mode)
+        response = await self.hass.async_add_executor_job(
+            self._pykumo.set_fan_speed, fan_mode
+        )
         _LOGGER.debug("Kumo %s set fan speed response: %s", self._name, response)
 
-    def turn_off(self):
-        """Turn the climate off. This implements https://www.home-assistant.io/integrations/climate/#action-climateturn_off."""
-        self.set_hvac_mode(HVACMode.OFF, caller="turn_off")
+        if response:
+            self._fan_mode = fan_mode
+            self.async_write_ha_state()
+        else:
+            self._request_refresh()
+
+    async def async_turn_off(self):
+        """Turn the climate off."""
+        await self.async_set_hvac_mode(HVACMode.OFF, caller="async_turn_off")
