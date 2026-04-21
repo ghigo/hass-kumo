@@ -196,6 +196,13 @@ class KumoThermostat(CoordinatedKumoEntity, ClimateEntity):
                 # Get out early if it's failing
                 break
 
+    async def async_update(self):
+        # Overrides CoordinatorEntity.async_update (which requests a coordinator
+        # refresh from the device). HA calls this after every service call; doing
+        # a device re-fetch mid-transition overwrites our optimistic state with a
+        # stale intermediate value. The coordinator's 60s timer still polls.
+        await self.update()
+
     def _update_property(self, prop):
         """Call to refresh the value of a property -- may block on I/O."""
         try:
